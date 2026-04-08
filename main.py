@@ -6,10 +6,10 @@ import traceback
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Set, Tuple
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.star import Context, Star
-from astrbot.core.message.components import Plain, Record
+from astrbot.core.message.components import At, Plain, Record
 from astrbot.core import file_token_service, logger
 from astrbot.core.star.register import register_on_decorating_result, register_on_llm_request
 from astrbot.core.provider.entities import ProviderRequest
@@ -18,12 +18,19 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 class TTSModifyPlugin(Star):
     TTS_TAG_START = "<tts>"
     TTS_TAG_END = "</tts>"
+    ADMIN_FORCE_VOICE_PROMPT = "本次回复需要包含语音消息"
     CONFIG_KEY_TTS_SETTINGS = "provider_tts_settings"
     CONFIG_KEY_ENABLE = "enable"
     CONFIG_KEY_TTS_PROMPT = "tts_prompt"
     CONFIG_KEY_NOTIFY_FAILURE = "notify_on_failure"
     CONFIG_KEY_AUTO_JP_VOICE_ENABLED = "auto_japanese_voice_enabled"
     CONFIG_KEY_AUTO_JP_VOICE_PROBABILITY = "auto_japanese_voice_probability"
+    CONFIG_KEY_AUTO_JP_VOICE_ADMIN_USER_IDS = "auto_japanese_voice_admin_user_ids"
+    CONFIG_KEY_AUTO_JP_VOICE_ADMIN_PROBABILITY = "auto_japanese_voice_admin_probability"
+    CONFIG_KEY_ADMIN_MENTION_KEYWORD_VOICE_ENTRIES = "admin_mention_keyword_voice_entries"
+    CONFIG_KEY_ADMIN_MENTION_KEYWORD_VOICE_KEYWORDS = "admin_mention_keyword_voice_keywords"
+    CONFIG_KEY_ADMIN_MENTION_KEYWORD_VOICE_PROBABILITY = "admin_mention_keyword_voice_probability"
+    CONFIG_KEY_ADMIN_MENTION_KEYWORD_VOICE_PROMPT = "admin_mention_keyword_voice_prompt"
     CONFIG_KEY_AUTO_JP_VOICE_MAX_CHARS = "auto_japanese_voice_max_chars"
     CONFIG_KEY_AUTO_JP_VOICE_COOLDOWN_SECONDS = "auto_japanese_voice_cooldown_seconds"
     CONFIG_KEY_AUTO_JP_TRANSLATE_PROMPT = "auto_japanese_voice_translate_prompt"
@@ -31,6 +38,15 @@ class TTSModifyPlugin(Star):
     DEFAULT_NOTIFY_ON_FAILURE = False
     DEFAULT_AUTO_JP_VOICE_ENABLED = False
     DEFAULT_AUTO_JP_VOICE_PROBABILITY = 20.0
+    DEFAULT_AUTO_JP_VOICE_ADMIN_USER_IDS = ""
+    DEFAULT_AUTO_JP_VOICE_ADMIN_PROBABILITY = -1.0
+    DEFAULT_ADMIN_MENTION_KEYWORD_VOICE_ENTRIES = ""
+    DEFAULT_ADMIN_MENTION_KEYWORD_VOICE_KEYWORDS = ""
+    DEFAULT_ADMIN_MENTION_KEYWORD_VOICE_PROBABILITY = 0.0
+    DEFAULT_ADMIN_MENTION_KEYWORD_VOICE_PROMPT = (
+        "当群聊消息@到管理员且命中指定关键词时，本次回复需要包含语音消息。\n"
+        "请根据当前对话自然回应，语气可以更温柔、亲近或安抚，但不要脱离上下文。"
+    )
     DEFAULT_AUTO_JP_VOICE_MAX_CHARS = 50
     DEFAULT_AUTO_JP_VOICE_COOLDOWN_SECONDS = 120
     DEFAULT_AUTO_JP_TRANSLATE_PROMPT = (
@@ -78,6 +94,8 @@ class TTSModifyPlugin(Star):
         super().__init__(context, config)
         self.config = config
         self._auto_jp_voice_last_trigger_at = {}
+        self._pending_forced_voice_events = set()
+        self._admin_mention_keyword_voice_last_trigger_at = {}
 
     def _get_plugin_config(self) -> dict:
         return self.config or {}
@@ -111,6 +129,510 @@ class TTSModifyPlugin(Star):
         if value is None:
             return default
         return str(value)
+
+    @staticmethod
+    def _split_id_config_text(text: str) -> Set[str]:
+        if not text:
+            return set()
+
+        normalized_ids = set()
+        for piece in re.split(r"[\s,，、;；|]+", text):
+            normalized_piece = TTSModifyPlugin._normalize_qq_id(piece)
+            if normalized_piece:
+                normalized_ids.add(normalized_piece)
+        return normalized_ids
+
+    @staticmethod
+    def _split_keyword_config_text(text: str) -> list[str]:
+        if not text:
+            return []
+
+        keywords = []
+        seen_keywords = set()
+        for piece in re.split(r"[\r\n,，;；|]+", text):
+            normalized_piece = piece.strip()
+            if not normalized_piece or normalized_piece in seen_keywords:
+                continue
+            keywords.append(normalized_piece)
+            seen_keywords.add(normalized_piece)
+        return keywords
+
+    def _parse_admin_mention_keyword_voice_entries(self) -> list[dict]:
+        raw_entries_text = self._get_text_config(
+            self.CONFIG_KEY_ADMIN_MENTION_KEYWORD_VOICE_ENTRIES,
+            self.DEFAULT_ADMIN_MENTION_KEYWORD_VOICE_ENTRIES,
+        )
+        if not raw_entries_text.strip():
+            return []
+
+        parsed_entries = []
+        for line_index, raw_line in enumerate(raw_entries_text.splitlines(), start=1):
+            stripped_line = raw_line.strip()
+            if not stripped_line or stripped_line.startswith("#"):
+                continue
+
+            normalized_line = stripped_line.replace("｜", "|")
+            parts = [part.strip() for part in normalized_line.split("|", 3)]
+            if len(parts) < 4:
+                logger.warning(
+                    f"@管理员关键词词条第 {line_index} 行格式无效，"
+                    "应为 关键词|概率|冷却秒数|提示词"
+                )
+                continue
+
+            keyword, probability_text, cooldown_text, prompt_text = parts
+            if not keyword:
+                logger.warning(f"@管理员关键词词条第 {line_index} 行缺少关键词，已跳过。")
+                continue
+
+            try:
+                probability = float(probability_text)
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"@管理员关键词词条第 {line_index} 行概率无效: {probability_text!r}，已跳过。"
+                )
+                continue
+
+            try:
+                cooldown_seconds = int(cooldown_text)
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"@管理员关键词词条第 {line_index} 行冷却秒数无效: {cooldown_text!r}，已跳过。"
+                )
+                continue
+
+            prompt_text = prompt_text.strip() or self.DEFAULT_ADMIN_MENTION_KEYWORD_VOICE_PROMPT
+            parsed_entries.append(
+                {
+                    "entry_id": f"{line_index}:{keyword}",
+                    "line_index": line_index,
+                    "keyword": keyword,
+                    "probability": max(0.0, min(100.0, probability)),
+                    "cooldown_seconds": max(0, cooldown_seconds),
+                    "prompt": prompt_text,
+                }
+            )
+
+        return parsed_entries
+
+    def _has_admin_mention_keyword_voice_entries_configured(self) -> bool:
+        return bool(
+            self._get_text_config(
+                self.CONFIG_KEY_ADMIN_MENTION_KEYWORD_VOICE_ENTRIES,
+                self.DEFAULT_ADMIN_MENTION_KEYWORD_VOICE_ENTRIES,
+            ).strip()
+        )
+
+    @staticmethod
+    def _normalize_qq_id(value) -> str:
+        raw_value = str(value).strip() if value is not None else ""
+        if not raw_value:
+            return ""
+
+        if ":" in raw_value:
+            raw_value = raw_value.split(":")[-1].strip()
+
+        digit_only = "".join(filter(str.isdigit, raw_value))
+        return digit_only or raw_value
+
+    @staticmethod
+    def _get_group_id_from_event(event: AstrMessageEvent) -> str:
+        try:
+            group_id = event.get_group_id()
+            if group_id:
+                return str(group_id).strip()
+        except Exception:
+            pass
+
+        message_obj = getattr(event, "message_obj", None)
+        if message_obj:
+            for attr_name in ("group_id", "groupId"):
+                value = getattr(message_obj, attr_name, None)
+                if value:
+                    return str(value).strip()
+
+        return ""
+
+    @staticmethod
+    def _get_sender_id_from_event(event: AstrMessageEvent) -> str:
+        try:
+            sender_id = event.get_sender_id()
+            if sender_id:
+                return str(sender_id).strip()
+        except Exception:
+            pass
+
+        message_obj = getattr(event, "message_obj", None)
+        if message_obj:
+            for attr_name in ("sender_id", "senderId", "user_id", "userId"):
+                value = getattr(message_obj, attr_name, None)
+                if value:
+                    return str(value).strip()
+
+            sender = getattr(message_obj, "sender", None)
+            if isinstance(sender, dict):
+                for key in ("user_id", "userId"):
+                    value = sender.get(key)
+                    if value:
+                        return str(value).strip()
+
+        return ""
+
+    @classmethod
+    def _is_group_message(cls, event: AstrMessageEvent) -> bool:
+        if cls._get_group_id_from_event(event):
+            return True
+        unified_msg_origin = str(getattr(event, "unified_msg_origin", "") or "")
+        return ":GroupMessage:" in unified_msg_origin
+
+    def _is_group_admin_sender(self, event: AstrMessageEvent) -> bool:
+        if not self._is_group_message(event):
+            return False
+
+        configured_admin_ids = self._get_configured_admin_qq_ids()
+        if not configured_admin_ids:
+            return False
+
+        sender_qq = self._normalize_qq_id(self._get_sender_id_from_event(event))
+        if not sender_qq:
+            return False
+
+        return sender_qq in configured_admin_ids
+
+    def _get_configured_admin_qq_ids(self) -> Set[str]:
+        return self._split_id_config_text(
+            self._get_text_config(
+                self.CONFIG_KEY_AUTO_JP_VOICE_ADMIN_USER_IDS,
+                self.DEFAULT_AUTO_JP_VOICE_ADMIN_USER_IDS,
+            )
+        )
+
+    @staticmethod
+    def _get_event_message_components(event: AstrMessageEvent) -> list:
+        try:
+            messages = event.get_messages()
+            if messages:
+                return list(messages)
+        except Exception:
+            pass
+
+        message_obj = getattr(event, "message_obj", None)
+        if message_obj:
+            raw_messages = getattr(message_obj, "message", None)
+            if isinstance(raw_messages, (list, tuple)):
+                return list(raw_messages)
+
+        return []
+
+    @classmethod
+    def _extract_mentioned_qq_ids(cls, event: AstrMessageEvent) -> Set[str]:
+        mentioned_ids = set()
+        mention_patterns = (r"<@(\d+)>", r"\[CQ:at,qq=(\d+)[^\]]*\]", r"\[At:(\d+)\]")
+
+        for comp in cls._get_event_message_components(event):
+            qq_value = None
+
+            if isinstance(comp, At):
+                qq_value = getattr(comp, "qq", None)
+            else:
+                comp_type = getattr(comp, "type", None)
+                if isinstance(comp_type, str) and comp_type.lower() == "at":
+                    qq_value = getattr(comp, "qq", None) or getattr(comp, "target", None)
+                    data = getattr(comp, "data", None)
+                    if qq_value is None and isinstance(data, dict):
+                        qq_value = data.get("qq") or data.get("target")
+
+            normalized_qq = cls._normalize_qq_id(qq_value)
+            if normalized_qq:
+                mentioned_ids.add(normalized_qq)
+
+            text_value = None
+            if isinstance(comp, Plain):
+                text_value = getattr(comp, "text", None)
+            else:
+                comp_type = getattr(comp, "type", None)
+                if isinstance(comp_type, str) and comp_type.lower() in {"plain", "text"}:
+                    text_value = getattr(comp, "text", None)
+                    data = getattr(comp, "data", None)
+                    if text_value is None and isinstance(data, dict):
+                        text_value = data.get("text")
+
+            if text_value:
+                for pattern in mention_patterns:
+                    for match in re.findall(pattern, str(text_value)):
+                        normalized_match = cls._normalize_qq_id(match)
+                        if normalized_match:
+                            mentioned_ids.add(normalized_match)
+
+        raw_text = str(
+            getattr(getattr(event, "message_obj", None), "message_str", "")
+            or getattr(event, "message_str", "")
+            or ""
+        )
+        if raw_text:
+            for pattern in mention_patterns:
+                for match in re.findall(pattern, raw_text):
+                    normalized_match = cls._normalize_qq_id(match)
+                    if normalized_match:
+                        mentioned_ids.add(normalized_match)
+
+        return mentioned_ids
+
+    def _is_message_mentioning_configured_admin(self, event: AstrMessageEvent) -> bool:
+        if not self._is_group_message(event):
+            return False
+
+        configured_admin_ids = self._get_configured_admin_qq_ids()
+        if not configured_admin_ids:
+            return False
+
+        return bool(self._extract_mentioned_qq_ids(event) & configured_admin_ids)
+
+    @classmethod
+    def _extract_event_text_for_keyword_match(cls, event: AstrMessageEvent) -> str:
+        raw_text = str(
+            getattr(getattr(event, "message_obj", None), "message_str", "")
+            or getattr(event, "message_str", "")
+            or ""
+        ).strip()
+        if raw_text:
+            return raw_text
+
+        parts = []
+        for comp in cls._get_event_message_components(event):
+            if isinstance(comp, At):
+                qq_value = cls._normalize_qq_id(getattr(comp, "qq", None))
+                if qq_value:
+                    parts.append(f"[At:{qq_value}]")
+                continue
+
+            if isinstance(comp, Plain):
+                text_value = getattr(comp, "text", None)
+                if text_value:
+                    parts.append(str(text_value))
+                continue
+
+            comp_type = getattr(comp, "type", None)
+            if isinstance(comp_type, str) and comp_type.lower() in {"plain", "text"}:
+                text_value = getattr(comp, "text", None)
+                data = getattr(comp, "data", None)
+                if text_value is None and isinstance(data, dict):
+                    text_value = data.get("text")
+                if text_value:
+                    parts.append(str(text_value))
+
+        return "".join(parts).strip()
+
+    @staticmethod
+    def _text_contains_any_keyword(text: str, keywords: list[str]) -> bool:
+        if not text or not keywords:
+            return False
+
+        folded_text = text.casefold()
+        return any(keyword.casefold() in folded_text for keyword in keywords if keyword)
+
+    def _matches_admin_voice_target(self, event: AstrMessageEvent) -> bool:
+        return self._is_group_admin_sender(event) or self._is_message_mentioning_configured_admin(event)
+
+    def _resolve_admin_target_probability(self, event: AstrMessageEvent) -> Optional[float]:
+        if not self._matches_admin_voice_target(event):
+            return None
+
+        admin_probability = self._get_float_config(
+            self.CONFIG_KEY_AUTO_JP_VOICE_ADMIN_PROBABILITY,
+            self.DEFAULT_AUTO_JP_VOICE_ADMIN_PROBABILITY,
+        )
+        if admin_probability < 0:
+            return self._resolve_auto_jp_voice_probability(event)
+
+        return max(0.0, min(100.0, admin_probability))
+
+    def _get_prioritized_admin_auto_jp_probability(self, event: AstrMessageEvent) -> Optional[float]:
+        if not self._is_group_admin_sender(event):
+            return None
+        admin_probability = self._get_float_config(
+            self.CONFIG_KEY_AUTO_JP_VOICE_ADMIN_PROBABILITY,
+            self.DEFAULT_AUTO_JP_VOICE_ADMIN_PROBABILITY,
+        )
+        if admin_probability < 0:
+            return None
+
+        return max(0.0, min(100.0, admin_probability))
+
+    def _resolve_auto_jp_voice_probability(self, event: AstrMessageEvent) -> float:
+        prioritized_admin_probability = self._get_prioritized_admin_auto_jp_probability(event)
+        if prioritized_admin_probability is not None:
+            return prioritized_admin_probability
+
+        default_probability = self._get_float_config(
+            self.CONFIG_KEY_AUTO_JP_VOICE_PROBABILITY,
+            self.DEFAULT_AUTO_JP_VOICE_PROBABILITY,
+        )
+        return max(0.0, min(100.0, default_probability))
+
+    def _should_force_admin_voice_prompt(self, event: AstrMessageEvent) -> bool:
+        if not self._get_bool_config(
+            self.CONFIG_KEY_AUTO_JP_VOICE_ENABLED,
+            self.DEFAULT_AUTO_JP_VOICE_ENABLED,
+        ):
+            return False
+
+        probability = self._resolve_admin_target_probability(event)
+        if probability is None:
+            return False
+
+        return probability > 0 and random.random() * 100 < probability
+
+    def _build_forced_voice_prompt_text(self, custom_prompt: str = "") -> str:
+        normalized_prompt = (custom_prompt or "").strip()
+        if not normalized_prompt:
+            return self.ADMIN_FORCE_VOICE_PROMPT
+
+        if self.ADMIN_FORCE_VOICE_PROMPT in normalized_prompt:
+            return normalized_prompt
+
+        return f"{self.ADMIN_FORCE_VOICE_PROMPT}\n{normalized_prompt}"
+
+    def _select_admin_mention_keyword_voice_entry(self, event: AstrMessageEvent) -> Optional[dict]:
+        entries = self._parse_admin_mention_keyword_voice_entries()
+        if not entries:
+            return None
+
+        event_text = self._extract_event_text_for_keyword_match(event)
+        if not event_text:
+            return None
+
+        matching_entries = [
+            entry
+            for entry in entries
+            if entry.get("keyword") and entry["keyword"].casefold() in event_text.casefold()
+        ]
+        if not matching_entries:
+            return None
+
+        matching_entries.sort(
+            key=lambda entry: (-len(str(entry["keyword"])), int(entry["line_index"]))
+        )
+        return matching_entries[0]
+
+    def _build_admin_mention_keyword_voice_cooldown_key(self, event: AstrMessageEvent, entry: dict) -> str:
+        return f"{getattr(event, 'unified_msg_origin', '')}:{entry['entry_id']}"
+
+    def _evaluate_admin_mention_keyword_voice_entry_trigger(
+        self,
+        event: AstrMessageEvent,
+    ) -> Tuple[bool, Optional[str]]:
+        if not self._is_group_message(event):
+            return False, None
+
+        if not self._is_message_mentioning_configured_admin(event):
+            return False, None
+
+        matched_entry = self._select_admin_mention_keyword_voice_entry(event)
+        if not matched_entry:
+            return False, None
+
+        cooldown_seconds = int(matched_entry["cooldown_seconds"])
+        if cooldown_seconds > 0:
+            cooldown_key = self._build_admin_mention_keyword_voice_cooldown_key(event, matched_entry)
+            last_trigger_at = self._admin_mention_keyword_voice_last_trigger_at.get(cooldown_key)
+            now = time.monotonic()
+            if last_trigger_at is not None and now - last_trigger_at < cooldown_seconds:
+                return True, None
+        else:
+            now = None
+
+        probability = float(matched_entry["probability"])
+        if probability <= 0 or random.random() * 100 >= probability:
+            return True, None
+
+        if cooldown_seconds > 0:
+            self._admin_mention_keyword_voice_last_trigger_at[cooldown_key] = (
+                now if now is not None else time.monotonic()
+            )
+
+        prompt_text = self._build_forced_voice_prompt_text(str(matched_entry["prompt"]))
+        return True, prompt_text
+
+    def _evaluate_legacy_admin_mention_keyword_voice_trigger(
+        self,
+        event: AstrMessageEvent,
+    ) -> Tuple[bool, Optional[str]]:
+        if not self._is_group_message(event):
+            return False, None
+
+        if not self._is_message_mentioning_configured_admin(event):
+            return False, None
+
+        keywords = self._split_keyword_config_text(
+            self._get_text_config(
+                self.CONFIG_KEY_ADMIN_MENTION_KEYWORD_VOICE_KEYWORDS,
+                self.DEFAULT_ADMIN_MENTION_KEYWORD_VOICE_KEYWORDS,
+            )
+        )
+        if not keywords:
+            return False, None
+
+        event_text = self._extract_event_text_for_keyword_match(event)
+        if not self._text_contains_any_keyword(event_text, keywords):
+            return False, None
+
+        probability = self._get_float_config(
+            self.CONFIG_KEY_ADMIN_MENTION_KEYWORD_VOICE_PROBABILITY,
+            self.DEFAULT_ADMIN_MENTION_KEYWORD_VOICE_PROBABILITY,
+        )
+        probability = max(0.0, min(100.0, probability))
+        if probability <= 0 or random.random() * 100 >= probability:
+            return True, None
+
+        custom_prompt = self._get_text_config(
+            self.CONFIG_KEY_ADMIN_MENTION_KEYWORD_VOICE_PROMPT,
+            self.DEFAULT_ADMIN_MENTION_KEYWORD_VOICE_PROMPT,
+        ).strip() or self.DEFAULT_ADMIN_MENTION_KEYWORD_VOICE_PROMPT
+        return True, self._build_forced_voice_prompt_text(custom_prompt)
+
+    def _evaluate_admin_mention_keyword_voice_trigger(
+        self,
+        event: AstrMessageEvent,
+    ) -> Tuple[bool, Optional[str]]:
+        if self._has_admin_mention_keyword_voice_entries_configured():
+            return self._evaluate_admin_mention_keyword_voice_entry_trigger(event)
+
+        return self._evaluate_legacy_admin_mention_keyword_voice_trigger(event)
+
+    def _resolve_forced_voice_prompt_injection(self, event: AstrMessageEvent) -> Optional[str]:
+        keyword_rule_matched, keyword_prompt = self._evaluate_admin_mention_keyword_voice_trigger(event)
+        if keyword_rule_matched:
+            return keyword_prompt
+
+        if self._should_force_admin_voice_prompt(event):
+            return self.ADMIN_FORCE_VOICE_PROMPT
+
+        return None
+
+    @classmethod
+    def _get_event_tracking_key(cls, event: AstrMessageEvent) -> str:
+        unified_msg_origin = str(getattr(event, "unified_msg_origin", "") or "")
+        message_obj = getattr(event, "message_obj", None)
+        message_id = getattr(message_obj, "message_id", None) if message_obj else None
+        if message_id not in (None, ""):
+            return f"{unified_msg_origin}:{message_id}"
+
+        sender_id = cls._get_sender_id_from_event(event)
+        if sender_id:
+            return f"{unified_msg_origin}:{sender_id}"
+
+        return f"{unified_msg_origin}:{id(event)}"
+
+    def _mark_pending_forced_voice_event(self, event: AstrMessageEvent):
+        self._pending_forced_voice_events.add(self._get_event_tracking_key(event))
+
+    def _consume_pending_forced_voice_event(self, event: AstrMessageEvent) -> bool:
+        event_key = self._get_event_tracking_key(event)
+        if event_key in self._pending_forced_voice_events:
+            self._pending_forced_voice_events.remove(event_key)
+            return True
+        return False
 
     @staticmethod
     def _extract_provider_text(response) -> str:
@@ -161,6 +683,24 @@ class TTSModifyPlugin(Star):
         if match:
             return match.group(1).strip()
         return cleaned
+
+    @classmethod
+    def _wrap_plain_japanese_as_tts(cls, translated_text: str, original_text: str) -> str:
+        cleaned_text = cls._cleanup_translated_japanese_text(translated_text)
+        if not cleaned_text:
+            return ""
+
+        if cls.TTS_TAG_START in cleaned_text and cls.TTS_TAG_END in cleaned_text:
+            return cleaned_text
+
+        normalized_tts_text = cls._normalize_tts_text(cleaned_text)
+        if not normalized_tts_text:
+            return ""
+
+        original_plain_text = (original_text or "").strip()
+        if original_plain_text:
+            return f"{cls.TTS_TAG_START}{normalized_tts_text}{cls.TTS_TAG_END}\n{original_plain_text}"
+        return f"{cls.TTS_TAG_START}{normalized_tts_text}{cls.TTS_TAG_END}"
 
     @classmethod
     def _normalize_similarity_text(text: str) -> str:
@@ -464,16 +1004,27 @@ class TTSModifyPlugin(Star):
             return
 
         # 3. 注入 Prompt
+        request.system_prompt = request.system_prompt or ""
         tts_prompt = self._get_text_config(self.CONFIG_KEY_TTS_PROMPT, "").strip()
         if tts_prompt:
             # Append to system prompt with a newline for safety
             request.system_prompt += f"\n{tts_prompt}"
+
+        forced_voice_prompt = self._resolve_forced_voice_prompt_injection(event)
+        if forced_voice_prompt:
+            request.system_prompt += f"\n{forced_voice_prompt}"
+            self._mark_pending_forced_voice_event(event)
+            logger.debug(
+                f"管理员语音提示注入已命中: {event.unified_msg_origin} -> {forced_voice_prompt}"
+            )
 
     @register_on_decorating_result(priority=10)
     async def on_decorate(self, event: AstrMessageEvent):
         result = event.get_result()
         if not result or not result.chain:
             return
+
+        forced_voice_requested = self._consume_pending_forced_voice_event(event)
 
         # 1. 获取配置
         try:
@@ -499,13 +1050,22 @@ class TTSModifyPlugin(Star):
             logger.error(f"会话 {event.unified_msg_origin} 缺少 TTS 服务提供商，但检测到 <tts> 标签。将剥离标签并显示文本。")
 
         if not has_tts_tag:
-            auto_chain = await self._maybe_convert_random_japanese_voice(
-                event,
-                result.chain,
-                tts_provider,
-                provider_tts_settings,
-                config,
-            )
+            if forced_voice_requested:
+                auto_chain = await self._force_convert_auto_japanese_voice(
+                    event,
+                    result.chain,
+                    tts_provider,
+                    provider_tts_settings,
+                    config,
+                )
+            else:
+                auto_chain = await self._maybe_convert_random_japanese_voice(
+                    event,
+                    result.chain,
+                    tts_provider,
+                    provider_tts_settings,
+                    config,
+                )
             if auto_chain:
                 result.chain = auto_chain
             return
@@ -551,11 +1111,14 @@ class TTSModifyPlugin(Star):
         if not is_plain_text_only or not original_text.strip():
             return None
 
+        is_admin_sender = self._is_group_admin_sender(event)
+        prioritized_admin_probability = self._get_prioritized_admin_auto_jp_probability(event)
+
         max_chars = self._get_int_config(
             self.CONFIG_KEY_AUTO_JP_VOICE_MAX_CHARS,
             self.DEFAULT_AUTO_JP_VOICE_MAX_CHARS,
         )
-        if max_chars > 0 and len(original_text.strip()) > max_chars:
+        if prioritized_admin_probability is None and max_chars > 0 and len(original_text.strip()) > max_chars:
             return None
 
         cooldown_seconds = max(
@@ -565,17 +1128,17 @@ class TTSModifyPlugin(Star):
                 self.DEFAULT_AUTO_JP_VOICE_COOLDOWN_SECONDS,
             ),
         )
-        if cooldown_seconds > 0:
+        if not is_admin_sender and cooldown_seconds > 0:
             now = time.monotonic()
             last_trigger_at = self._auto_jp_voice_last_trigger_at.get(event.unified_msg_origin)
             if last_trigger_at is not None and now - last_trigger_at < cooldown_seconds:
                 return None
 
-        probability = self._get_float_config(
-            self.CONFIG_KEY_AUTO_JP_VOICE_PROBABILITY,
-            self.DEFAULT_AUTO_JP_VOICE_PROBABILITY,
+        probability = (
+            prioritized_admin_probability
+            if prioritized_admin_probability is not None
+            else self._resolve_auto_jp_voice_probability(event)
         )
-        probability = max(0.0, min(100.0, probability))
         if probability <= 0 or random.random() * 100 >= probability:
             return None
 
@@ -588,7 +1151,7 @@ class TTSModifyPlugin(Star):
             f"自动日语语音命中: {original_text!r} -> {tts_formatted_message!r}"
         )
 
-        if cooldown_seconds > 0:
+        if not is_admin_sender and cooldown_seconds > 0:
             self._auto_jp_voice_last_trigger_at[event.unified_msg_origin] = time.monotonic()
 
         if self.TTS_TAG_START in tts_formatted_message and self.TTS_TAG_END in tts_formatted_message:
@@ -600,6 +1163,45 @@ class TTSModifyPlugin(Star):
             )
 
         logger.warning("自动日语语音模式未返回合法 <tts> 格式，保留原始文本发送。")
+        return None
+
+    async def _force_convert_auto_japanese_voice(
+        self,
+        event: AstrMessageEvent,
+        chain: list,
+        tts_provider,
+        provider_settings: dict,
+        config: dict,
+    ) -> Optional[list]:
+        if self._chain_contains_audio(chain):
+            return None
+
+        tts_enabled = provider_settings.get(self.CONFIG_KEY_ENABLE, False)
+        if not tts_enabled or not tts_provider:
+            return None
+
+        is_plain_text_only, original_text = self._extract_plain_text_chain(chain)
+        if not is_plain_text_only or not original_text.strip():
+            return None
+
+        tts_formatted_message = await self._build_auto_japanese_tts_message(event, original_text)
+        if not tts_formatted_message:
+            logger.warning("管理员语音提示已命中，但兜底转换失败，保留原始文本发送。")
+            return None
+
+        logger.debug(
+            f"管理员语音提示已命中，结果阶段执行兜底转换: {original_text!r} -> {tts_formatted_message!r}"
+        )
+
+        if self.TTS_TAG_START in tts_formatted_message and self.TTS_TAG_END in tts_formatted_message:
+            return await self._process_tts_tags(
+                tts_formatted_message,
+                tts_provider,
+                provider_settings,
+                config,
+            )
+
+        logger.warning("管理员语音提示已命中，但兜底转换未返回合法 <tts> 格式，保留原始文本发送。")
         return None
 
     async def _build_auto_japanese_tts_message(self, event: AstrMessageEvent, text: str) -> str:
@@ -631,10 +1233,14 @@ class TTSModifyPlugin(Star):
             logger.debug(traceback.format_exc())
             return ""
 
-        translated_text = self._extract_provider_text(response)
-        translated_text = self._cleanup_translated_japanese_text(translated_text)
+        raw_translated_text = self._extract_provider_text(response)
+        translated_text = self._cleanup_translated_japanese_text(raw_translated_text)
         translated_text = self._extract_tts_formatted_message(translated_text)
         translated_text = self._build_canonical_auto_tts_message(translated_text, text)
+        if not translated_text:
+            translated_text = self._wrap_plain_japanese_as_tts(raw_translated_text, text)
+            if translated_text:
+                logger.debug("自动日语语音模式检测到纯日语输出，已自动补全为 <tts> 格式。")
         return translated_text.strip()
 
     async def _process_tts_tags(self, text: str, tts_provider, provider_settings: dict, config: dict) -> list:
