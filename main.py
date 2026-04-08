@@ -4,6 +4,7 @@ import re
 import time
 import traceback
 import unicodedata
+from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional, Set, Tuple
@@ -96,9 +97,14 @@ class TTSModifyPlugin(Star):
         self._auto_jp_voice_last_trigger_at = {}
         self._pending_forced_voice_events = set()
         self._admin_mention_keyword_voice_last_trigger_at = {}
+        self._admin_mention_keyword_voice_last_trigger_date = {}
+        self._admin_mention_keyword_voice_user_daily_trigger_date = {}
 
     def _get_plugin_config(self) -> dict:
         return self.config or {}
+
+    def _get_raw_config_value(self, key: str, default=None):
+        return self._get_plugin_config().get(key, default)
 
     def _get_bool_config(self, key: str, default: bool = False) -> bool:
         value = self._get_plugin_config().get(key, default)
@@ -157,15 +163,102 @@ class TTSModifyPlugin(Star):
             seen_keywords.add(normalized_piece)
         return keywords
 
+    @classmethod
+    def _normalize_entry_keywords(cls, *raw_values) -> list[str]:
+        keywords = []
+        seen_keywords = set()
+        for raw_value in raw_values:
+            if raw_value is None:
+                continue
+
+            if isinstance(raw_value, (list, tuple, set)):
+                split_keywords = []
+                for item in raw_value:
+                    split_keywords.extend(cls._split_keyword_config_text(str(item)))
+            else:
+                split_keywords = cls._split_keyword_config_text(str(raw_value))
+
+            for keyword in split_keywords:
+                normalized_keyword = keyword.strip()
+                folded_keyword = normalized_keyword.casefold()
+                if not normalized_keyword or folded_keyword in seen_keywords:
+                    continue
+                keywords.append(normalized_keyword)
+                seen_keywords.add(folded_keyword)
+
+        return keywords
+
     def _parse_admin_mention_keyword_voice_entries(self) -> list[dict]:
-        raw_entries_text = self._get_text_config(
+        raw_entries_value = self._get_raw_config_value(
             self.CONFIG_KEY_ADMIN_MENTION_KEYWORD_VOICE_ENTRIES,
             self.DEFAULT_ADMIN_MENTION_KEYWORD_VOICE_ENTRIES,
         )
-        if not raw_entries_text.strip():
+        parsed_entries = []
+
+        if isinstance(raw_entries_value, list):
+            for line_index, raw_entry in enumerate(raw_entries_value, start=1):
+                if not isinstance(raw_entry, dict):
+                    logger.warning(
+                        f"@管理员关键词词条第 {line_index} 项不是对象，已跳过。"
+                    )
+                    continue
+
+                if not bool(raw_entry.get("enabled", True)):
+                    continue
+
+                keywords = self._normalize_entry_keywords(
+                    raw_entry.get("keywords", ""),
+                    raw_entry.get("keyword", ""),
+                )
+                if not keywords:
+                    logger.warning(
+                        f"@管理员关键词词条第 {line_index} 项缺少关键词，已跳过。"
+                    )
+                    continue
+
+                primary_keyword = keywords[0]
+                entry_name = str(raw_entry.get("name", "")).strip() or primary_keyword
+
+                try:
+                    probability = float(raw_entry.get("probability", 100))
+                except (TypeError, ValueError):
+                    logger.warning(
+                        f"@管理员关键词词条 {entry_name!r} 的概率无效，已跳过。"
+                    )
+                    continue
+
+                try:
+                    cooldown_seconds = int(raw_entry.get("cooldown_seconds", 0))
+                except (TypeError, ValueError):
+                    logger.warning(
+                        f"@管理员关键词词条 {entry_name!r} 的冷却秒数无效，已跳过。"
+                    )
+                    continue
+
+                prompt_text = (
+                    str(raw_entry.get("prompt", "")).strip()
+                    or self.DEFAULT_ADMIN_MENTION_KEYWORD_VOICE_PROMPT
+                )
+                parsed_entries.append(
+                    {
+                        "entry_id": f"{line_index}:{entry_name}",
+                        "line_index": line_index,
+                        "name": entry_name,
+                        "keyword": primary_keyword,
+                        "keywords": keywords,
+                        "probability": max(0.0, min(100.0, probability)),
+                        "cooldown_seconds": max(0, cooldown_seconds),
+                        "daily_once": bool(raw_entry.get("daily_once", False)),
+                        "per_user_daily_once": bool(raw_entry.get("per_user_daily_once", False)),
+                        "prompt": prompt_text,
+                    }
+                )
+            return parsed_entries
+
+        raw_entries_text = str(raw_entries_value or "").strip()
+        if not raw_entries_text:
             return []
 
-        parsed_entries = []
         for line_index, raw_line in enumerate(raw_entries_text.splitlines(), start=1):
             stripped_line = raw_line.strip()
             if not stripped_line or stripped_line.startswith("#"):
@@ -180,10 +273,13 @@ class TTSModifyPlugin(Star):
                 )
                 continue
 
-            keyword, probability_text, cooldown_text, prompt_text = parts
-            if not keyword:
+            keyword_text, probability_text, cooldown_text, prompt_text = parts
+            keywords = self._normalize_entry_keywords(keyword_text)
+            if not keywords:
                 logger.warning(f"@管理员关键词词条第 {line_index} 行缺少关键词，已跳过。")
                 continue
+
+            primary_keyword = keywords[0]
 
             try:
                 probability = float(probability_text)
@@ -204,11 +300,15 @@ class TTSModifyPlugin(Star):
             prompt_text = prompt_text.strip() or self.DEFAULT_ADMIN_MENTION_KEYWORD_VOICE_PROMPT
             parsed_entries.append(
                 {
-                    "entry_id": f"{line_index}:{keyword}",
+                    "entry_id": f"{line_index}:{primary_keyword}",
                     "line_index": line_index,
-                    "keyword": keyword,
+                    "name": primary_keyword,
+                    "keyword": primary_keyword,
+                    "keywords": keywords,
                     "probability": max(0.0, min(100.0, probability)),
                     "cooldown_seconds": max(0, cooldown_seconds),
+                    "daily_once": False,
+                    "per_user_daily_once": False,
                     "prompt": prompt_text,
                 }
             )
@@ -216,12 +316,13 @@ class TTSModifyPlugin(Star):
         return parsed_entries
 
     def _has_admin_mention_keyword_voice_entries_configured(self) -> bool:
-        return bool(
-            self._get_text_config(
-                self.CONFIG_KEY_ADMIN_MENTION_KEYWORD_VOICE_ENTRIES,
-                self.DEFAULT_ADMIN_MENTION_KEYWORD_VOICE_ENTRIES,
-            ).strip()
+        raw_entries_value = self._get_raw_config_value(
+            self.CONFIG_KEY_ADMIN_MENTION_KEYWORD_VOICE_ENTRIES,
+            self.DEFAULT_ADMIN_MENTION_KEYWORD_VOICE_ENTRIES,
         )
+        if isinstance(raw_entries_value, list):
+            return len(raw_entries_value) > 0
+        return bool(str(raw_entries_value or "").strip())
 
     @staticmethod
     def _normalize_qq_id(value) -> str:
@@ -502,21 +603,46 @@ class TTSModifyPlugin(Star):
         if not event_text:
             return None
 
-        matching_entries = [
-            entry
-            for entry in entries
-            if entry.get("keyword") and entry["keyword"].casefold() in event_text.casefold()
-        ]
+        folded_event_text = event_text.casefold()
+        matching_entries = []
+        for entry in entries:
+            entry_keywords = entry.get("keywords") or self._normalize_entry_keywords(
+                entry.get("keyword", "")
+            )
+            matched_keywords = [
+                keyword
+                for keyword in entry_keywords
+                if keyword and keyword.casefold() in folded_event_text
+            ]
+            if not matched_keywords:
+                continue
+
+            best_matched_keyword = max(matched_keywords, key=len)
+            matching_entries.append((entry, best_matched_keyword))
+
         if not matching_entries:
             return None
 
         matching_entries.sort(
-            key=lambda entry: (-len(str(entry["keyword"])), int(entry["line_index"]))
+            key=lambda item: (-len(str(item[1])), int(item[0]["line_index"]))
         )
-        return matching_entries[0]
+        selected_entry, matched_keyword = matching_entries[0]
+        resolved_entry = dict(selected_entry)
+        resolved_entry["matched_keyword"] = matched_keyword
+        return resolved_entry
 
     def _build_admin_mention_keyword_voice_cooldown_key(self, event: AstrMessageEvent, entry: dict) -> str:
         return f"{getattr(event, 'unified_msg_origin', '')}:{entry['entry_id']}"
+
+    def _build_admin_mention_keyword_voice_user_daily_key(self, event: AstrMessageEvent, entry: dict) -> str:
+        sender_qq = self._normalize_qq_id(self._get_sender_id_from_event(event))
+        if sender_qq:
+            return f"{entry['entry_id']}:{sender_qq}"
+        return f"{entry['entry_id']}:{getattr(event, 'unified_msg_origin', '')}"
+
+    @staticmethod
+    def _get_local_business_date_text() -> str:
+        return datetime.now().astimezone().date().isoformat()
 
     def _evaluate_admin_mention_keyword_voice_entry_trigger(
         self,
@@ -532,9 +658,27 @@ class TTSModifyPlugin(Star):
         if not matched_entry:
             return False, None
 
+        cooldown_key = self._build_admin_mention_keyword_voice_cooldown_key(event, matched_entry)
+        needs_date_text = bool(matched_entry.get("daily_once", False)) or bool(
+            matched_entry.get("per_user_daily_once", False)
+        )
+        if needs_date_text:
+            current_date_text = self._get_local_business_date_text()
+            if bool(matched_entry.get("daily_once", False)):
+                last_trigger_date = self._admin_mention_keyword_voice_last_trigger_date.get(cooldown_key)
+                if last_trigger_date == current_date_text:
+                    return True, None
+            if bool(matched_entry.get("per_user_daily_once", False)):
+                user_daily_key = self._build_admin_mention_keyword_voice_user_daily_key(event, matched_entry)
+                last_user_trigger_date = self._admin_mention_keyword_voice_user_daily_trigger_date.get(user_daily_key)
+                if last_user_trigger_date == current_date_text:
+                    return True, None
+        else:
+            current_date_text = None
+            user_daily_key = None
+
         cooldown_seconds = int(matched_entry["cooldown_seconds"])
         if cooldown_seconds > 0:
-            cooldown_key = self._build_admin_mention_keyword_voice_cooldown_key(event, matched_entry)
             last_trigger_at = self._admin_mention_keyword_voice_last_trigger_at.get(cooldown_key)
             now = time.monotonic()
             if last_trigger_at is not None and now - last_trigger_at < cooldown_seconds:
@@ -550,6 +694,11 @@ class TTSModifyPlugin(Star):
             self._admin_mention_keyword_voice_last_trigger_at[cooldown_key] = (
                 now if now is not None else time.monotonic()
             )
+        if current_date_text is not None:
+            if bool(matched_entry.get("daily_once", False)):
+                self._admin_mention_keyword_voice_last_trigger_date[cooldown_key] = current_date_text
+            if bool(matched_entry.get("per_user_daily_once", False)) and user_daily_key is not None:
+                self._admin_mention_keyword_voice_user_daily_trigger_date[user_daily_key] = current_date_text
 
         prompt_text = self._build_forced_voice_prompt_text(str(matched_entry["prompt"]))
         return True, prompt_text

@@ -41,15 +41,81 @@
   },
   "admin_mention_keyword_voice_entries": {
     "description": "@管理员关键词词条",
-    "type": "text",
-    "default": "",
-    "hint": "推荐使用的新配置。每行一个词条，格式：关键词|概率|冷却秒数|提示词。支持 # 开头注释行。例如：摸摸|100|30|请温柔地用语音回应对方的撒娇请求。多个词条同时命中时，优先匹配更长的关键词；长度相同则按配置顺序。"
+    "type": "template_list",
+    "hint": "推荐使用的新配置。只有在群聊中 @ 到管理员 QQ，且消息命中某个关键词词条时，这条规则才会参与判定。每个词条可以填写多个关键词。多个词条或多个关键词同时命中时，优先匹配更长的关键词；长度相同则按配置顺序。",
+    "templates": {
+      "default": {
+        "name": "关键词词条",
+        "items": {
+          "name": {
+            "description": "名称",
+            "type": "string",
+            "default": "新词条",
+            "hint": "仅用于区分和管理这条配置，方便你在面板里识别。"
+          },
+          "enabled": {
+            "description": "启用",
+            "type": "bool",
+            "default": true,
+            "hint": "关闭后，这条词条将完全不参与触发判断。"
+          },
+          "keyword": {
+            "description": "关键词列表",
+            "type": "text",
+            "default": "",
+            "hint": "支持逗号、分号或换行分隔。只要消息文本包含其中任意一个关键词，且消息同时 @ 到管理员 QQ，就会进入这条词条的概率判定。"
+          },
+          "probability": {
+            "description": "触发概率(%)",
+            "type": "int",
+            "default": 100,
+            "slider": {
+              "min": 0,
+              "max": 100,
+              "step": 1
+            },
+            "hint": "命中这条词条后的独立触发概率。"
+          },
+          "cooldown_seconds": {
+            "description": "冷却秒数",
+            "type": "int",
+            "default": 0,
+            "slider": {
+              "min": 0,
+              "max": 600,
+              "step": 1
+            },
+            "hint": "同一会话中，这条词条两次成功触发之间至少要间隔多久。填 0 表示不限制。"
+          },
+          "daily_once": {
+            "description": "每天最多一次",
+            "type": "bool",
+            "default": false,
+            "hint": "开启后，这条词条在同一会话里每天最多只会成功触发一次。会和上面的冷却同时生效。"
+          },
+          "per_user_daily_once": {
+            "description": "每人每天最多一次",
+            "type": "bool",
+            "default": false,
+            "hint": "开启后，这条词条对同一个发送者每天最多只会成功触发一次。会和“每天最多一次”及冷却同时生效。"
+          },
+          "prompt": {
+            "description": "提示词",
+            "type": "text",
+            "default": "请温柔地用语音回应对方的撒娇请求。",
+            "hint": "这条词条命中且概率成功后，会把这里的内容注入到本次请求里。插件会自动补上“本次回复需要包含语音消息”。"
+          }
+        }
+      }
+    },
+    "default": []
   },
   "admin_mention_keyword_voice_keywords": {
     "description": "@管理员关键词(旧版兼容)",
     "type": "text",
     "default": "",
-    "hint": "旧版兼容配置。仅当上方“@管理员关键词词条”为空时才会生效。支持逗号、分号或换行分隔，例如：摸摸,抱抱。"
+    "hint": "旧版兼容配置。仅当上方“@管理员关键词词条”为空时才会生效。支持逗号、分号或换行分隔，例如：摸摸,抱抱。",
+    "invisible": true
   },
   "admin_mention_keyword_voice_probability": {
     "description": "@管理员关键词触发概率(旧版兼容)",
@@ -57,13 +123,15 @@
     "default": 0,
     "min": 0,
     "max": 100,
-    "hint": "旧版兼容配置。仅当上方“@管理员关键词词条”为空时才会生效。"
+    "hint": "旧版兼容配置。仅当上方“@管理员关键词词条”为空时才会生效。",
+    "invisible": true
   },
   "admin_mention_keyword_voice_prompt": {
     "description": "@管理员关键词提示词(旧版兼容)",
     "type": "text",
     "default": "当群聊消息@到管理员且命中指定关键词时，本次回复需要包含语音消息。\n请根据当前对话自然回应，语气可以更温柔、亲近或安抚，但不要脱离上下文。",
-    "hint": "旧版兼容配置。仅当上方“@管理员关键词词条”为空时才会生效。"
+    "hint": "旧版兼容配置。仅当上方“@管理员关键词词条”为空时才会生效。",
+    "invisible": true
   },
   "auto_japanese_voice_max_chars": {
     "description": "触发最大字数",
