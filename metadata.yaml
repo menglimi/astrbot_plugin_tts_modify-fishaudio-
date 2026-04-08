@@ -1,4 +1,4 @@
-name: astrbot_plugin_tts_modify
+name: astrbot_plugin_tts_modify-fishaudio-
 display_name: FishAudio TTS 日语优化
 author: L1ke40oz
 desc: 面向 FishAudio TTS 的 AstrBot 日语优化插件，在原插件基础上补充日语清洗与自动日语语音能力。
