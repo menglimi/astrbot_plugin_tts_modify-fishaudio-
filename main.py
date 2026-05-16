@@ -1,24 +1,32 @@
+import base64
+import builtins
 import html
+import os
 import random
 import re
+import subprocess
 import time
 import traceback
 import unicodedata
 from datetime import datetime
 from difflib import SequenceMatcher
+from inspect import isawaitable
 from pathlib import Path
 from typing import Optional, Set, Tuple
-from astrbot.api.event import AstrMessageEvent
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star
 from astrbot.core.message.components import At, Plain, Record
 from astrbot.core import file_token_service, logger
-from astrbot.core.star.register import register_on_decorating_result, register_on_llm_request
+from astrbot.core.star.register import register_on_llm_request
 from astrbot.core.provider.entities import ProviderRequest
+from astrbot.api.provider import LLMResponse
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 class TTSModifyPlugin(Star):
     TTS_TAG_START = "<tts>"
     TTS_TAG_END = "</tts>"
+    TTS_BLOCK_PLACEHOLDER_PREFIX = "[[TTSBLOCK:"
+    TTS_BLOCK_PLACEHOLDER_SUFFIX = "]]"
     ADMIN_FORCE_VOICE_PROMPT = "本次回复需要包含语音消息"
     CONFIG_KEY_TTS_SETTINGS = "provider_tts_settings"
     CONFIG_KEY_ENABLE = "enable"
@@ -35,6 +43,9 @@ class TTSModifyPlugin(Star):
     CONFIG_KEY_AUTO_JP_VOICE_MAX_CHARS = "auto_japanese_voice_max_chars"
     CONFIG_KEY_AUTO_JP_VOICE_COOLDOWN_SECONDS = "auto_japanese_voice_cooldown_seconds"
     CONFIG_KEY_AUTO_JP_TRANSLATE_PROMPT = "auto_japanese_voice_translate_prompt"
+    CONFIG_KEY_AUTO_JP_FULL_CONVERSION_ENABLED = "auto_japanese_voice_full_conversion_enabled"
+    CONFIG_KEY_LOCAL_AUDIO_PLAYBACK_ENABLED = "local_audio_playback_enabled"
+    CONFIG_KEY_VTUBE_SUBTITLE_SYNC_ENABLED = "vtube_subtitle_sync_enabled"
     INTERNAL_AUTO_JP_TRANSLATE_MARKER = "[TTS_MODIFY_AUTO_JP_TRANSLATE]"
     DEFAULT_NOTIFY_ON_FAILURE = False
     DEFAULT_AUTO_JP_VOICE_ENABLED = False
@@ -50,20 +61,24 @@ class TTSModifyPlugin(Star):
     )
     DEFAULT_AUTO_JP_VOICE_MAX_CHARS = 50
     DEFAULT_AUTO_JP_VOICE_COOLDOWN_SECONDS = 120
+    DEFAULT_AUTO_JP_FULL_CONVERSION_ENABLED = False
+    DEFAULT_LOCAL_AUDIO_PLAYBACK_ENABLED = False
+    DEFAULT_VTUBE_SUBTITLE_SYNC_ENABLED = False
     DEFAULT_AUTO_JP_TRANSLATE_PROMPT = (
-        "当你想要发送语音时，使用<tts></tts>标签包裹需要转语音的文本，语音可放在句中的任意位置。\n"
+        "当你想要发送语音时，使用<tts></tts>标签包裹需要转语音的文本，语音可放在句中的任意位置，注意内容的连续性而不是把一句话说两遍。\n"
         "你必须严格按照以下TTS格式输出内容：\n\n"
         "1. 默认语音消息为日语，除非特别说明其他语言。未经允许不能发送中文语音消息。所有日语内容必须包裹在 <tts> 成对标签中，不嵌套、不遗漏闭合。\n"
         "2. 情感标签请使用日语自然表达，并用[]包裹，参考情感：[嬉しそうに]、[悲しそうに]、[怒ったように]、[落ち着いた調子で]、[緊張した様子で]、[自信ありげに]、[驚いたように]、[満足そうに]、[怯えたように]、[心配そうに]、[落ち込んだように]、[苛立ったように]、[憂鬱そうに]、[共感するように]、[恥ずかしそうに]、[嫌悪感を込めて]、[感動したように]、[誇らしげに]、[リラックスして]、[感謝を込めて]、[興味深そうに]、[皮肉っぽく]。请根据语境选择标签或使用自然语言描述，不要使用英文情感标签。可在[]中加入自然停顿、笑声和其他类人元素，使语音更具吸引力和真实感。\n"
-        "3. 为了让消息更连贯，可以保留少量不重复的中文铺垫文本放在 <tts> 标签前，把更适合强调、收尾或情绪表达的后半句改成日语语音。\n"
-        "4. 如果在 </tts> 后补充中文文本，只保留与语音内容对应、且不会和前文重复的那一小段，不要把整段原文完整重复一遍。\n"
-        "5. 要避免标签前后的中文与语音表达语义重复，读起来要像一句自然接上的话，而不是同一句话先说中文再说日语。\n\n"
+        "3. 输出的语音文本必须翻译成日语，发出语音后，必须在后面换行，附上原本对应的中文内容。\n\n"
         "输出格式示例：\n"
         "1.今天只对你悄悄说一句：<tts>[優しく]おやすみ、いい夢を。</tts>\n"
-        "2.先别着急，<tts>[落ち着いた調子で]ゆっくり話して。</tts>\n"
-        "3.我知道你已经很努力了。<tts>[感謝を込めて]本当にありがとう。</tts>\n"
-        "4.如果你还想继续，我就陪你到最后。<tts>[眠たそうに]もう......限界だけど、君が納得するまで付き合ってあげる。</tts>\n\n"
-        "现在请把我提供的中文内容，改写成符合以上规范的输出。不要解释，不要添加格式说明。"
+        "晚安，祝你好梦。\n"
+        "2.<tts>[嬉しそうに]今日は本当に嬉しい！</tts>\n"
+        "今天真的很开心！\n"
+        "3.<tts>大丈夫だよ、[落ち着いた調子で]ゆっくり話して。</tts>\n"
+        "没关系，慢慢说。\n"
+        "4.<tts>[眠たそうに]もう......本当に[吸い込む]限界だよ。[小さく笑う]でも、君が納得するまで付き合ってあげる。</tts>\n"
+        "我真的……已经快到极限了。不过，只要你还没满意，我还是会继续陪着你。"
     )
     EMOTION_TAG_NATURAL_LANGUAGE = {
         "sleepy": {
@@ -96,12 +111,37 @@ class TTSModifyPlugin(Star):
         self.config = config
         self._auto_jp_voice_last_trigger_at = {}
         self._pending_forced_voice_events = set()
+        self._pending_llm_response_events = set()
         self._admin_mention_keyword_voice_last_trigger_at = {}
         self._admin_mention_keyword_voice_last_trigger_date = {}
         self._admin_mention_keyword_voice_user_daily_trigger_date = {}
 
     def _get_plugin_config(self) -> dict:
         return self.config or {}
+
+    def _refresh_runtime_config(self, event: Optional[AstrMessageEvent] = None) -> dict:
+        base_config = self._get_plugin_config()
+
+        try:
+            if event is not None:
+                runtime_config = self.context.get_config(event.unified_msg_origin)
+            else:
+                runtime_config = self.context.get_config()
+        except KeyError:
+            try:
+                runtime_config = self.context.get_config()
+            except Exception:
+                return base_config
+        except Exception:
+            return base_config
+
+        if not isinstance(runtime_config, dict):
+            return base_config
+
+        merged_config = dict(base_config)
+        merged_config.update(runtime_config)
+        self.config = merged_config
+        return merged_config
 
     def _get_raw_config_value(self, key: str, default=None):
         return self._get_plugin_config().get(key, default)
@@ -333,7 +373,7 @@ class TTSModifyPlugin(Star):
         if ":" in raw_value:
             raw_value = raw_value.split(":")[-1].strip()
 
-        digit_only = "".join(filter(str.isdigit, raw_value))
+        digit_only = "".join(builtins.filter(str.isdigit, raw_value))
         return digit_only or raw_value
 
     @staticmethod
@@ -783,6 +823,16 @@ class TTSModifyPlugin(Star):
             return True
         return False
 
+    def _mark_pending_llm_response_event(self, event: AstrMessageEvent):
+        self._pending_llm_response_events.add(self._get_event_tracking_key(event))
+
+    def _consume_pending_llm_response_event(self, event: AstrMessageEvent) -> bool:
+        event_key = self._get_event_tracking_key(event)
+        if event_key in self._pending_llm_response_events:
+            self._pending_llm_response_events.remove(event_key)
+            return True
+        return False
+
     @staticmethod
     def _extract_provider_text(response) -> str:
         if not response:
@@ -819,6 +869,73 @@ class TTSModifyPlugin(Star):
                 return True
         return False
 
+    @classmethod
+    def _chain_contains_tts_marker(cls, chain) -> bool:
+        for comp in chain:
+            if isinstance(comp, Plain) and cls._contains_tts_marker(comp.text):
+                return True
+        return False
+
+    def _extract_leading_record_segment(self, chain: list) -> tuple[Optional[list], list]:
+        """提取“首个可见组件是语音且后续还有文本”的前置语音段，避免与正文混发。"""
+        if not chain:
+            return None, chain
+
+        first_visible_index = None
+        for index, comp in enumerate(chain):
+            if isinstance(comp, At):
+                continue
+            if isinstance(comp, Plain) and not (comp.text or "").strip():
+                continue
+            first_visible_index = index
+            break
+
+        if first_visible_index is None:
+            return None, chain
+
+        first_visible_component = chain[first_visible_index]
+        if not isinstance(first_visible_component, Record):
+            return None, chain
+
+        next_visible_plain_index = None
+        for index in range(first_visible_index + 1, len(chain)):
+            comp = chain[index]
+            if isinstance(comp, Plain) and (comp.text or "").strip():
+                next_visible_plain_index = index
+                break
+
+        if next_visible_plain_index is None:
+            return None, chain
+
+        leading_segment = [chain[first_visible_index]]
+        remaining_chain = list(chain[:first_visible_index]) + list(chain[first_visible_index + 1:])
+        return leading_segment, remaining_chain
+
+    async def _send_leading_record_segment_if_needed(
+        self,
+        event: AstrMessageEvent,
+        result,
+        chain: list,
+    ) -> list:
+        if getattr(result, "__tts_modify_leading_record_sent", False):
+            return chain
+
+        leading_segment, remaining_chain = self._extract_leading_record_segment(chain)
+        if not leading_segment:
+            return chain
+
+        try:
+            message_chain = MessageChain()
+            message_chain.chain = leading_segment
+            await self.context.send_message(event.unified_msg_origin, message_chain)
+            setattr(result, "__tts_modify_leading_record_sent", True)
+            logger.debug("检测到回复首项为语音且后续存在文本，已先行单独发送首条语音。")
+            return remaining_chain
+        except Exception as e:
+            logger.error(f"首条语音单独发送失败，保留原消息链继续发送: {e}")
+            logger.debug(traceback.format_exc())
+            return chain
+
     @staticmethod
     def _extract_tts_formatted_message(text: str) -> str:
         if not text:
@@ -832,6 +949,102 @@ class TTSModifyPlugin(Star):
         if match:
             return match.group(1).strip()
         return cleaned
+
+    @classmethod
+    def _contains_tts_marker(cls, text: str) -> bool:
+        if not text:
+            return False
+        return cls.TTS_TAG_START in text or cls.TTS_TAG_END in text
+
+    @classmethod
+    def _strip_tts_markers(cls, text: str) -> str:
+        if not text:
+            return ""
+        return text.replace(cls.TTS_TAG_START, "").replace(cls.TTS_TAG_END, "")
+
+    @staticmethod
+    def _sanitize_plain_output_text(text: str) -> str:
+        if not text:
+            return ""
+        sanitized = text.replace("\\n", " ")
+        sanitized = sanitized.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+        sanitized = re.sub(r"\s+", " ", sanitized)
+        return sanitized.strip()
+
+    @staticmethod
+    def _contains_japanese_kana(text: str) -> bool:
+        if not text:
+            return False
+        return bool(re.search(r"[\u3040-\u30FF\u31F0-\u31FF\uFF66-\uFF9F]", text))
+
+    @classmethod
+    def _build_tts_failure_plain_text(
+        cls,
+        fallback_text: str,
+        notify_failure: bool,
+    ) -> str:
+        sanitized_fallback_text = cls._sanitize_plain_output_text(fallback_text)
+        if cls._contains_japanese_kana(sanitized_fallback_text):
+            return "[TTS失败]" if notify_failure else ""
+        if notify_failure:
+            return cls._sanitize_plain_output_text(f"[TTS失败] {sanitized_fallback_text}")
+        return sanitized_fallback_text
+
+    @staticmethod
+    def _looks_like_non_japanese_tts_text(text: str) -> bool:
+        if not text:
+            return False
+
+        # 去掉情绪/动作标签后，再判断正文语言，避免仅因日语标签存在就误判为日语正文。
+        content = re.sub(r"\[[^\[\]]*\]", " ", text)
+        content = re.sub(r"\s+", " ", content).strip()
+        if not content:
+            return False
+
+        kana_count = len(re.findall(r"[\u3040-\u309F\u30A0-\u30FF\u31F0-\u31FF\uFF66-\uFF9F]", content))
+        han_count = len(re.findall(r"[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]", content))
+
+        if han_count == 0:
+            return False
+
+        # 正文几乎没有假名、却有较明显的汉字量时，极大概率是中文，不交给日语 TTS 去念。
+        return kana_count == 0 or han_count >= max(4, kana_count * 3)
+
+    @classmethod
+    def _encode_tts_blocks_for_splitter(cls, text: str) -> str:
+        if not text or cls.TTS_TAG_START not in text or cls.TTS_TAG_END not in text:
+            return text
+
+        pattern = re.compile(
+            rf"{re.escape(cls.TTS_TAG_START)}.*?{re.escape(cls.TTS_TAG_END)}",
+            re.DOTALL,
+        )
+
+        def repl(match: re.Match) -> str:
+            raw_block = match.group(0)
+            encoded = base64.urlsafe_b64encode(raw_block.encode("utf-8")).decode("ascii")
+            return f"{cls.TTS_BLOCK_PLACEHOLDER_PREFIX}{encoded}{cls.TTS_BLOCK_PLACEHOLDER_SUFFIX}"
+
+        return pattern.sub(repl, text)
+
+    @classmethod
+    def _decode_tts_blocks_from_splitter(cls, text: str) -> str:
+        if not text or cls.TTS_BLOCK_PLACEHOLDER_PREFIX not in text:
+            return text
+
+        pattern = re.compile(
+            rf"{re.escape(cls.TTS_BLOCK_PLACEHOLDER_PREFIX)}([A-Za-z0-9_\-=]+){re.escape(cls.TTS_BLOCK_PLACEHOLDER_SUFFIX)}"
+        )
+
+        def repl(match: re.Match) -> str:
+            encoded = match.group(1)
+            try:
+                return base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8")
+            except Exception:
+                logger.warning(f"TTS 占位块解码失败，保留原文: {encoded!r}")
+                return match.group(0)
+
+        return pattern.sub(repl, text)
 
     @classmethod
     def _wrap_plain_japanese_as_tts(cls, translated_text: str, original_text: str) -> str:
@@ -974,6 +1187,30 @@ class TTSModifyPlugin(Star):
 
         return "\n".join(canonical_parts)
 
+    @classmethod
+    def _build_full_auto_tts_message(cls, generated_text: str, original_text: str) -> str:
+        """完全转换模式：整段原文只对应一个完整 TTS 片段，文本区保留原文。"""
+        if not generated_text:
+            return ""
+
+        match = re.search(
+            rf"{re.escape(cls.TTS_TAG_START)}(.*?){re.escape(cls.TTS_TAG_END)}",
+            generated_text,
+            re.DOTALL,
+        )
+        if not match:
+            return cls._wrap_plain_japanese_as_tts(generated_text, original_text)
+
+        tts_content = match.group(1).strip()
+        if not tts_content:
+            return ""
+
+        parts = [f"{cls.TTS_TAG_START}{tts_content}{cls.TTS_TAG_END}"]
+        original_plain_text = (original_text or "").strip()
+        if original_plain_text:
+            parts.append(original_plain_text)
+        return "\n".join(parts)
+
     @staticmethod
     def _extract_plain_text_chain(chain) -> Tuple[bool, str]:
         texts = []
@@ -993,6 +1230,7 @@ class TTSModifyPlugin(Star):
 
         text = html.unescape(text)
         text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"\s*\n+\s*", " ", text)
 
         # 去除零宽字符、BOM 和大部分不可见控制字符，但保留换行以便后续统一处理。
         text = re.sub(r"[\u200B-\u200D\u2060\uFEFF]", "", text)
@@ -1125,6 +1363,9 @@ class TTSModifyPlugin(Star):
 
     @register_on_llm_request()
     async def on_llm_req(self, event: AstrMessageEvent, request: ProviderRequest):
+        self._refresh_runtime_config(event)
+        self._mark_pending_llm_response_event(event)
+
         if request.system_prompt and self.INTERNAL_AUTO_JP_TRANSLATE_MARKER in request.system_prompt:
             request.system_prompt = request.system_prompt.replace(
                 self.INTERNAL_AUTO_JP_TRANSLATE_MARKER,
@@ -1167,10 +1408,39 @@ class TTSModifyPlugin(Star):
                 f"管理员语音提示注入已命中: {event.unified_msg_origin} -> {forced_voice_prompt}"
             )
 
-    @register_on_decorating_result(priority=10)
+    @filter.on_llm_response(priority=1000)
+    async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
+        self._refresh_runtime_config(event)
+
+        completion_text = getattr(resp, "completion_text", None)
+        if isinstance(completion_text, str) and self.TTS_TAG_START in completion_text and self.TTS_TAG_END in completion_text:
+            encoded_text = self._encode_tts_blocks_for_splitter(completion_text)
+            if encoded_text != completion_text:
+                logger.debug("已在 on_llm_response 阶段保护 TTS 片段，避免被 splitter 拆开。")
+                resp.completion_text = encoded_text
+
+    # 必须先于 splitter 处理 <tts> 标签。
+    # 这里使用超高正优先级，兼容“数值越大越早执行”的调度顺序。
+    @filter.on_decorating_result(priority=100000000000000001)
     async def on_decorate(self, event: AstrMessageEvent):
+        self._refresh_runtime_config(event)
         result = event.get_result()
         if not result or not result.chain:
+            return
+
+        had_protected_tts_block = False
+        for comp in result.chain:
+            if isinstance(comp, Plain) and comp.text and self.TTS_BLOCK_PLACEHOLDER_PREFIX in comp.text:
+                had_protected_tts_block = True
+                decoded_text = self._decode_tts_blocks_from_splitter(comp.text)
+                if decoded_text != comp.text:
+                    logger.debug("已在结果阶段还原 TTS 占位块。")
+                    comp.text = decoded_text
+
+        had_pending_llm_response = self._consume_pending_llm_response_event(event)
+        has_tts_tag = self._chain_contains_tts_marker(result.chain)
+
+        if not had_protected_tts_block and not had_pending_llm_response and not has_tts_tag:
             return
 
         forced_voice_requested = self._consume_pending_forced_voice_event(event)
@@ -1185,14 +1455,8 @@ class TTSModifyPlugin(Star):
             return
             
         provider_tts_settings = config.get(self.CONFIG_KEY_TTS_SETTINGS, {})
-        
-        # 2. 检查消息中是否包含TTS标签
-        has_tts_tag = False
-        for comp in result.chain:
-            if isinstance(comp, Plain) and self.TTS_TAG_START in comp.text:
-                has_tts_tag = True
-                break
 
+        # 2. 检查消息中是否包含TTS标签
         # 3. 获取TTS服务提供商
         tts_provider = self.context.get_using_tts_provider(event.unified_msg_origin)
         if has_tts_tag and not tts_provider:
@@ -1216,23 +1480,26 @@ class TTSModifyPlugin(Star):
                     config,
                 )
             if auto_chain:
-                result.chain = auto_chain
+                result.chain = await self._send_leading_record_segment_if_needed(
+                    event,
+                    result,
+                    auto_chain,
+                )
             return
 
-        # 4. 处理标签
-        new_chain = []
-        modified = False
-        
-        for comp in result.chain:
-            if isinstance(comp, Plain) and self.TTS_TAG_START in comp.text:
-                components = await self._process_tts_tags(comp.text, tts_provider, provider_tts_settings, config)
-                new_chain.extend(components)
-                modified = True
-            else:
-                new_chain.append(comp)
-
+        # 4. 处理标签。这里按整条 chain 串流解析，避免 <tts>...</tts> 被拆到多个 Plain 组件后漏处理。
+        new_chain, modified = await self._process_tts_chain(
+            result.chain,
+            tts_provider,
+            provider_tts_settings,
+            config,
+        )
         if modified:
-            result.chain = new_chain
+            result.chain = await self._send_leading_record_segment_if_needed(
+                event,
+                result,
+                new_chain,
+            )
 
     async def _maybe_convert_random_japanese_voice(
         self,
@@ -1369,6 +1636,13 @@ class TTSModifyPlugin(Star):
             self.CONFIG_KEY_AUTO_JP_TRANSLATE_PROMPT,
             self.DEFAULT_AUTO_JP_TRANSLATE_PROMPT,
         ).strip() or self.DEFAULT_AUTO_JP_TRANSLATE_PROMPT
+        full_conversion_enabled = self._should_use_full_auto_japanese_conversion()
+        if full_conversion_enabled:
+            system_prompt += (
+                "\n\n完全转换模式要求：必须把输入的整段原文完整转换为一段适合朗读的日语，"
+                "不要只转换其中一句、后半句或摘要。输出中 <tts> 前不要添加中文铺垫；"
+                "格式必须为：<tts>完整日语朗读文本</tts>，随后换行附上原中文全文。"
+            )
 
         try:
             response = await provider.text_chat(
@@ -1385,12 +1659,156 @@ class TTSModifyPlugin(Star):
         raw_translated_text = self._extract_provider_text(response)
         translated_text = self._cleanup_translated_japanese_text(raw_translated_text)
         translated_text = self._extract_tts_formatted_message(translated_text)
-        translated_text = self._build_canonical_auto_tts_message(translated_text, text)
+        if full_conversion_enabled:
+            translated_text = self._build_full_auto_tts_message(translated_text, text)
+        else:
+            translated_text = self._build_canonical_auto_tts_message(translated_text, text)
         if not translated_text:
             translated_text = self._wrap_plain_japanese_as_tts(raw_translated_text, text)
             if translated_text:
                 logger.debug("自动日语语音模式检测到纯日语输出，已自动补全为 <tts> 格式。")
         return translated_text.strip()
+
+    def _should_use_full_auto_japanese_conversion(self) -> bool:
+        if self._is_vtube_live_mode_active():
+            return True
+
+        if not self._get_bool_config(
+            self.CONFIG_KEY_AUTO_JP_FULL_CONVERSION_ENABLED,
+            self.DEFAULT_AUTO_JP_FULL_CONVERSION_ENABLED,
+        ):
+            return False
+
+        return True
+
+    def _play_audio_locally_once(self, audio_path: str):
+        if not self._get_bool_config(
+            self.CONFIG_KEY_LOCAL_AUDIO_PLAYBACK_ENABLED,
+            self.DEFAULT_LOCAL_AUDIO_PLAYBACK_ENABLED,
+        ):
+            return
+
+        if not audio_path:
+            return
+
+        try:
+            audio_file = Path(audio_path).resolve()
+            if not audio_file.is_file():
+                logger.warning(f"TTS 自动播放失败，音频文件不存在: {audio_path}")
+                return
+
+            if os.name == "nt":
+                command = self._build_windows_local_playback_command(audio_file)
+                subprocess.Popen(
+                    command,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                return
+
+            opener = "open" if os.name == "posix" and os.uname().sysname == "Darwin" else "xdg-open"
+            subprocess.Popen(
+                [opener, str(audio_file)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            logger.error(f"TTS 自动播放失败: {e}")
+            logger.debug(traceback.format_exc())
+
+    @staticmethod
+    def _build_windows_local_playback_command(audio_file: Path) -> list[str]:
+        audio_uri = audio_file.as_uri().replace("'", "''")
+        script = (
+            "Add-Type -AssemblyName PresentationCore;"
+            "$player=New-Object System.Windows.Media.MediaPlayer;"
+            f"$player.Open([Uri]'{audio_uri}');"
+            "$player.Play();"
+            "$deadline=(Get-Date).AddSeconds(120);"
+            "Start-Sleep -Milliseconds 500;"
+            "while((Get-Date) -lt $deadline){"
+            "if($player.NaturalDuration.HasTimeSpan -and "
+            "$player.Position -ge $player.NaturalDuration.TimeSpan){break};"
+            "Start-Sleep -Milliseconds 200"
+            "};"
+            "$player.Close()"
+        )
+        return [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            script,
+        ]
+
+    def _find_vtube_studio_plugin(self):
+        try:
+            stars = self.context.get_all_stars()
+        except Exception as e:
+            logger.debug(f"获取插件列表失败，无法联动 VTube 字幕: {e}")
+            return None
+
+        for star in stars or []:
+            plugin_name = str(getattr(star, "name", "") or "")
+            module_path = str(getattr(star, "module_path", "") or "")
+            if (
+                plugin_name == "astrbot_plugin_vtube_studio"
+                or module_path.endswith("astrbot_plugin_vtube_studio.main")
+            ):
+                return getattr(star, "star_cls", None)
+        return None
+
+    def _is_vtube_live_mode_active(self) -> bool:
+        vtube_plugin = self._find_vtube_studio_plugin()
+        if not vtube_plugin:
+            return False
+
+        is_running = getattr(vtube_plugin, "_is_bili_live_running", None)
+        if callable(is_running):
+            try:
+                return bool(is_running())
+            except Exception as e:
+                logger.debug(f"读取 VTube 直播状态失败: {e}")
+
+        live_task = getattr(vtube_plugin, "_bili_live_task", None)
+        if live_task is not None:
+            try:
+                return not live_task.done()
+            except Exception:
+                return False
+
+        return False
+
+    async def _push_vtube_subtitle_for_tts(self, subtitle_text: str):
+        if not self._get_bool_config(
+            self.CONFIG_KEY_VTUBE_SUBTITLE_SYNC_ENABLED,
+            self.DEFAULT_VTUBE_SUBTITLE_SYNC_ENABLED,
+        ):
+            return
+
+        cleaned_text = self._sanitize_plain_output_text(subtitle_text)
+        if not cleaned_text:
+            return
+
+        vtube_plugin = self._find_vtube_studio_plugin()
+        push_subtitle = getattr(vtube_plugin, "_push_subtitle", None) if vtube_plugin else None
+        if not callable(push_subtitle):
+            logger.debug("未找到可用的 VTube Studio 字幕插件实例，已跳过 TTS 字幕联动。")
+            return
+
+        try:
+            result = push_subtitle(cleaned_text)
+            if isawaitable(result):
+                await result
+        except Exception as e:
+            logger.error(f"TTS 联动 VTube 字幕失败: {e}")
+            logger.debug(traceback.format_exc())
 
     async def _process_tts_tags(self, text: str, tts_provider, provider_settings: dict, config: dict) -> list:
         """处理文本中的 TTS 标签，返回组件列表"""
@@ -1404,7 +1822,9 @@ class TTSModifyPlugin(Star):
             if match.start() > last_idx:
                 pre_text = text[last_idx:match.start()]
                 if pre_text:
-                    parts.append(Plain(pre_text))
+                    sanitized_pre_text = self._sanitize_plain_output_text(pre_text)
+                    if sanitized_pre_text:
+                        parts.append(Plain(sanitized_pre_text))
             
             # 处理 TTS 内容
             tts_content = match.group(1).strip()
@@ -1421,9 +1841,119 @@ class TTSModifyPlugin(Star):
         if last_idx < len(text):
             post_text = text[last_idx:]
             if post_text:
-                parts.append(Plain(post_text))
-        
-        return parts
+                sanitized_post_text = self._sanitize_plain_output_text(post_text)
+                if sanitized_post_text:
+                    parts.append(Plain(sanitized_post_text))
+
+        if not parts and self._contains_tts_marker(text):
+            stripped_text = self._strip_tts_markers(text)
+            if stripped_text:
+                sanitized_stripped_text = self._sanitize_plain_output_text(stripped_text)
+                if sanitized_stripped_text:
+                    parts.append(Plain(sanitized_stripped_text))
+            return parts
+
+        sanitized_parts = []
+        for part in parts:
+            if isinstance(part, Plain) and self._contains_tts_marker(part.text):
+                stripped_text = self._strip_tts_markers(part.text)
+                if stripped_text:
+                    sanitized_stripped_text = self._sanitize_plain_output_text(stripped_text)
+                    if sanitized_stripped_text:
+                        sanitized_parts.append(Plain(sanitized_stripped_text))
+            else:
+                sanitized_parts.append(part)
+
+        return sanitized_parts
+
+    async def _process_tts_chain(self, chain: list, tts_provider, provider_settings: dict, config: dict) -> tuple[list, bool]:
+        """按组件流解析 TTS 标签，支持标签和正文跨多个 Plain 组件。"""
+        if not chain:
+            return chain, False
+
+        new_chain = []
+        plain_buffer = []
+        tts_buffer = []
+        inside_tts = False
+        modified = False
+
+        def flush_plain_buffer():
+            if plain_buffer:
+                merged_text = "".join(plain_buffer)
+                plain_buffer.clear()
+                sanitized_merged_text = self._sanitize_plain_output_text(merged_text)
+                if sanitized_merged_text:
+                    new_chain.append(Plain(sanitized_merged_text))
+
+        for comp in chain:
+            if not isinstance(comp, Plain):
+                flush_plain_buffer()
+                if inside_tts:
+                    tts_buffer.append("")
+                new_chain.append(comp)
+                continue
+
+            text = comp.text or ""
+            cursor = 0
+
+            while cursor < len(text):
+                if inside_tts:
+                    end_idx = text.find(self.TTS_TAG_END, cursor)
+                    if end_idx == -1:
+                        tts_buffer.append(text[cursor:])
+                        cursor = len(text)
+                        break
+
+                    tts_buffer.append(text[cursor:end_idx])
+                    tts_content = "".join(tts_buffer).strip()
+                    tts_buffer.clear()
+                    inside_tts = False
+                    modified = True
+                    if tts_content:
+                        tts_components = await self._create_tts_component(
+                            tts_content,
+                            tts_provider,
+                            provider_settings,
+                            config,
+                        )
+                        if tts_components:
+                            flush_plain_buffer()
+                            new_chain.extend(tts_components)
+                    cursor = end_idx + len(self.TTS_TAG_END)
+                    continue
+
+                start_idx = text.find(self.TTS_TAG_START, cursor)
+                if start_idx == -1:
+                    trailing_text = text[cursor:]
+                    if self.TTS_TAG_END in trailing_text:
+                        logger.debug(f"TTS 组件流解析：清理孤立结束标签 -> {trailing_text!r}")
+                        trailing_text = self._strip_tts_markers(trailing_text)
+                        modified = True
+                    if trailing_text:
+                        plain_buffer.append(trailing_text)
+                    break
+
+                prefix_text = text[cursor:start_idx]
+                if self.TTS_TAG_END in prefix_text:
+                    logger.debug(f"TTS 组件流解析：清理前缀中的孤立结束标签 -> {prefix_text!r}")
+                    prefix_text = self._strip_tts_markers(prefix_text)
+                    modified = True
+                if prefix_text:
+                    plain_buffer.append(prefix_text)
+
+                inside_tts = True
+                modified = True
+                cursor = start_idx + len(self.TTS_TAG_START)
+
+        if inside_tts:
+            dangling_tts_text = "".join(tts_buffer)
+            logger.debug(f"TTS 组件流解析：检测到未闭合开始标签，按普通文本回退 -> {dangling_tts_text!r}")
+            if dangling_tts_text:
+                plain_buffer.append(dangling_tts_text)
+            modified = True
+
+        flush_plain_buffer()
+        return new_chain, modified
 
     async def _create_tts_component(
         self,
@@ -1438,12 +1968,18 @@ class TTSModifyPlugin(Star):
         res_components = []
         audio_path = None
         normalized_tts_content = self._normalize_tts_text(tts_content)
-        display_fallback_text = fallback_text if fallback_text is not None else normalized_tts_content
+        display_fallback_text = self._normalize_tts_text(
+            fallback_text if fallback_text is not None else normalized_tts_content
+        )
         
         tts_enabled = provider_settings.get(self.CONFIG_KEY_ENABLE, False)
         
         if tts_enabled and tts_provider:
             try:
+                if self._looks_like_non_japanese_tts_text(normalized_tts_content):
+                    logger.warning(f"TTS 文本疑似为非日语正文，已回退为普通文本: {normalized_tts_content!r}")
+                    raise ValueError("non_japanese_tts_text")
+
                 if normalized_tts_content != tts_content:
                     logger.debug(f"TTS 文本已清洗: {tts_content!r} -> {normalized_tts_content!r}")
 
@@ -1459,10 +1995,16 @@ class TTSModifyPlugin(Star):
                         audio_path = None
                         
             except Exception as e:
-                logger.error(f"TTS 生成失败: {e}")
-                logger.debug(traceback.format_exc())
+                if str(e) == "non_japanese_tts_text":
+                    audio_path = None
+                else:
+                    logger.error(f"TTS 生成失败: {e}")
+                    logger.debug(traceback.format_exc())
             
             if audio_path:
+                await self._push_vtube_subtitle_for_tts(normalized_tts_content)
+                self._play_audio_locally_once(audio_path)
+
                 # 成功：转换为 Record
                 use_file_service = provider_settings.get("use_file_service", False)
                 callback_api_base = config.get("callback_api_base", "")
@@ -1479,22 +2021,35 @@ class TTSModifyPlugin(Star):
                 res_components.append(Record(file=url or audio_path, url=url or audio_path))
 
                 if success_text is not None:
-                    res_components.append(Plain(success_text))
+                    sanitized_success_text = self._sanitize_plain_output_text(success_text)
+                    if sanitized_success_text:
+                        res_components.append(Plain(sanitized_success_text))
                 elif dual_output:
-                    res_components.append(Plain(normalized_tts_content))
+                    sanitized_dual_output_text = self._sanitize_plain_output_text(normalized_tts_content)
+                    if sanitized_dual_output_text:
+                        res_components.append(Plain(sanitized_dual_output_text))
             else:
                 # 生成失败 或 路径不安全
-                if provider_settings.get(self.CONFIG_KEY_NOTIFY_FAILURE, self.DEFAULT_NOTIFY_ON_FAILURE):
-                    res_components.append(Plain(f"[TTS失败] {display_fallback_text}"))
-                else:
-                    res_components.append(Plain(display_fallback_text))
+                failure_plain_text = self._build_tts_failure_plain_text(
+                    display_fallback_text,
+                    provider_settings.get(
+                        self.CONFIG_KEY_NOTIFY_FAILURE,
+                        self.DEFAULT_NOTIFY_ON_FAILURE,
+                    ),
+                )
+                if failure_plain_text:
+                    res_components.append(Plain(failure_plain_text))
                     
         elif not tts_enabled:
             # TTS 未启用
             logger.warning(f"检测到 TTS 标签，但全局配置中 TTS 未启用。剥离标签并显示文本。")
-            res_components.append(Plain(display_fallback_text))
+            sanitized_fallback_text = self._sanitize_plain_output_text(display_fallback_text)
+            if sanitized_fallback_text:
+                res_components.append(Plain(sanitized_fallback_text))
         else:
             # 没 provider
-            res_components.append(Plain(display_fallback_text))
+            sanitized_fallback_text = self._sanitize_plain_output_text(display_fallback_text)
+            if sanitized_fallback_text:
+                res_components.append(Plain(sanitized_fallback_text))
 
         return res_components
