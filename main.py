@@ -25,6 +25,8 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 class TTSModifyPlugin(Star):
     TTS_TAG_START = "<tts>"
     TTS_TAG_END = "</tts>"
+    TTS_TAG_ALIAS_START_PATTERN = re.compile(r"<t{3,}s>", re.IGNORECASE)
+    TTS_TAG_ALIAS_END_PATTERN = re.compile(r"</t{3,}s>", re.IGNORECASE)
     TTS_BLOCK_PLACEHOLDER_PREFIX = "[[TTSBLOCK:"
     TTS_BLOCK_PLACEHOLDER_SUFFIX = "]]"
     ADMIN_FORCE_VOICE_PROMPT = "本次回复需要包含语音消息"
@@ -936,12 +938,20 @@ class TTSModifyPlugin(Star):
             logger.debug(traceback.format_exc())
             return chain
 
-    @staticmethod
-    def _extract_tts_formatted_message(text: str) -> str:
+    @classmethod
+    def _normalize_tts_marker_aliases(cls, text: str) -> str:
+        if not text:
+            return ""
+        normalized = cls.TTS_TAG_ALIAS_START_PATTERN.sub(cls.TTS_TAG_START, text)
+        normalized = cls.TTS_TAG_ALIAS_END_PATTERN.sub(cls.TTS_TAG_END, normalized)
+        return normalized
+
+    @classmethod
+    def _extract_tts_formatted_message(cls, text: str) -> str:
         if not text:
             return ""
 
-        cleaned = text.strip()
+        cleaned = cls._normalize_tts_marker_aliases(text).strip()
         match = re.search(
             r"(?s)(.*?<tts>.*?</tts>\s*(?:\r?\n.*)?)",
             cleaned,
@@ -954,13 +964,19 @@ class TTSModifyPlugin(Star):
     def _contains_tts_marker(cls, text: str) -> bool:
         if not text:
             return False
-        return cls.TTS_TAG_START in text or cls.TTS_TAG_END in text
+        if cls.TTS_TAG_START in text or cls.TTS_TAG_END in text:
+            return True
+        return bool(
+            cls.TTS_TAG_ALIAS_START_PATTERN.search(text)
+            or cls.TTS_TAG_ALIAS_END_PATTERN.search(text)
+        )
 
     @classmethod
     def _strip_tts_markers(cls, text: str) -> str:
         if not text:
             return ""
-        return text.replace(cls.TTS_TAG_START, "").replace(cls.TTS_TAG_END, "")
+        normalized = cls._normalize_tts_marker_aliases(text)
+        return normalized.replace(cls.TTS_TAG_START, "").replace(cls.TTS_TAG_END, "")
 
     @staticmethod
     def _sanitize_plain_output_text(text: str) -> str:
@@ -1012,6 +1028,7 @@ class TTSModifyPlugin(Star):
 
     @classmethod
     def _encode_tts_blocks_for_splitter(cls, text: str) -> str:
+        text = cls._normalize_tts_marker_aliases(text)
         if not text or cls.TTS_TAG_START not in text or cls.TTS_TAG_END not in text:
             return text
 
@@ -1812,6 +1829,7 @@ class TTSModifyPlugin(Star):
 
     async def _process_tts_tags(self, text: str, tts_provider, provider_settings: dict, config: dict) -> list:
         """处理文本中的 TTS 标签，返回组件列表"""
+        text = self._normalize_tts_marker_aliases(text)
         parts = []
         # 使用非贪婪匹配
         pattern = re.compile(f"{self.TTS_TAG_START}(.*?){self.TTS_TAG_END}", re.DOTALL)
@@ -1893,7 +1911,7 @@ class TTSModifyPlugin(Star):
                 new_chain.append(comp)
                 continue
 
-            text = comp.text or ""
+            text = self._normalize_tts_marker_aliases(comp.text or "")
             cursor = 0
 
             while cursor < len(text):
