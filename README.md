@@ -1,7 +1,5 @@
 # fishaudio tts日语优化 插件说明
 
-> **群聊通知（2026-10-11）：** 原群聊被停用一周，期间可先加入 bot 群：**145326153**。
-
 `astrbot_plugin_tts_modify-fishaudio-` 是面向 AstrBot 的 FishAudio TTS 日语优化插件。它在原插件基础上保留 `<tts>...</tts>` 标签模式，并补充日语文本清洗、随机日语语音模式、原中文文本保留与短文本触发控制等能力。
 
 当前插件内部唯一名为 `astrbot_plugin_tts_modify-fishaudio-`，对外展示名为 `FishAudio TTS 日语优化`。
